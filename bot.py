@@ -4,6 +4,8 @@ import datetime
 import requests
 import uuid
 import re
+import csv
+import io
 from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,16 +16,38 @@ from telegram.ext import (
 from openpyxl import Workbook, load_workbook
 from bs4 import BeautifulSoup
 
-# Токен вашего бота
+# ===== КОНФИГУРАЦИЯ =====
 TOKEN = "8469792881:AAFm7dZytI-1iIWft4cSssSPBjXWjjVSdw8"
 XLSX_FILE = "uploads.xlsx"
+ADMIN_ID = 8398543828
+CSV_FILE = "uploads.csv"
 
 # Буферы и константы
-pending_bytes = defaultdict(list)  # Для байтов фото по (chat_id, media_group_id или file_id)
-recent_uploads = {}  # Кэш последних загруженных файлов: file_id -> datetime
-choice_keys = {}  # Для хранения коротких ID -> реального key
+pending_bytes = defaultdict(list)
+recent_uploads = {}
+choice_keys = {}
 DUPLICATE_INTERVAL = datetime.timedelta(minutes=10)
 
+# ===== CSV ФУНКЦИИ =====
+def ensure_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "UserID", "Username", "FileID", "URL", "Hosting"])
+
+def append_csv(user_id: int, username: str, file_id: str, url: str, hosting: str):
+    ensure_csv()
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([timestamp, user_id, username or "Unknown", file_id, url, hosting])
+
+def get_csv_content() -> bytes:
+    ensure_csv()
+    with open(CSV_FILE, 'r', encoding='utf-8') as f:
+        return f.read().encode('utf-8')
+
+# ===== EXCEL ФУНКЦИИ =====
 def ensure_workbook():
     if not os.path.exists(XLSX_FILE):
         wb = Workbook()
@@ -38,6 +62,7 @@ def append_record(user_id: int, username: str, file_id: str, url: str, hosting: 
     ws.append([timestamp, user_id, username or "", file_id, url, hosting])
     wb.save(XLSX_FILE)
 
+# ===== ЗАГРУЗКА НА ХОСТИНГИ =====
 def upload_to_anoimage(image_bytes: bytes, filename: str) -> str:
     files = {"file": (filename, image_bytes, "image/jpeg")}
     headers = {
@@ -86,8 +111,35 @@ def upload_to_ninjabox(image_bytes: bytes, filename: str) -> str:
     url_match = re.search(r"https://nbox\.me/[a-f0-9\-]+", response_text)
     if url_match:
         return url_match.group(0)
-    raise ValueError("Не удалось извлечь ссылку. Структура страницы не соответствует ожидаемой.")
+    raise ValueError("Не удалось извлечь ссылку.")
 
+# ===== КРАСИВОЕ УВЕДОМЛЕНИЕ АДМИНУ =====
+async def send_admin_notification(context, user_id: int, username: str, url: str, hosting: str):
+    try:
+        hosting_emoji = "🖼️" if hosting == "anoimage" else "📦"
+        hosting_name = "Anoimage.com" if hosting == "anoimage" else "Ninjabox.org"
+        
+        message = (
+            f"<b>🎬 НОВАЯ ЗАГРУЗКА!</b>\n\n"
+            f"👤 <b>Пользователь:</b> <code>{username or f'ID {user_id}'}</code>\n"
+            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
+            f"{hosting_emoji} <b>Хостинг:</b> {hosting_name}\n"
+            f"⏰ <b>Время:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"<b>🔗 Ссылка на фото:</b>\n"
+            f"<a href='{url}'>Открыть</a>\n\n"
+            f"<code>{url}</code>"
+        )
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+    except Exception as e:
+        print(f"Ошибка при отправке админу: {e}")
+
+# ===== КОМАНДЫ БОТА =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sticker = "CAACAgIAAxkBAAEPJWRonJ6NS7DK4cSC8GBQ768xBoZG1wACDwEAAlKJkSNldRdchg_VhjYE"
     await context.bot.send_sticker(update.effective_chat.id, sticker)
@@ -107,29 +159,59 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "<b>ℹ️ Команды бота:</b>\n"
         "/start — запустить бота\n"
-        "/help — показать справку"
+        "/help — показать справку\n"
+        "/stats — получить CSV с загрузками (только администратор)"
     )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_html("❌ У тебя нет прав на эту команду!")
+        return
+    
+    try:
+        ensure_csv()
+        csv_bytes = get_csv_content()
+        
+        await update.message.reply_document(
+            document=io.BytesIO(csv_bytes),
+            filename=f"uploads_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            caption="📊 <b>CSV с данными о загрузках</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_html(f"❌ Ошибка: {e}")
 
 async def process_pending(key, hosting, context, msg, user, now):
     await asyncio.sleep(1)
     photos = pending_bytes.pop(key, [])
     urls = []
+    
     for file_id, img_bytes in photos:
         try:
             if hosting == "anoimage":
                 url = upload_to_anoimage(img_bytes, f"{file_id}.jpg")
             else:
                 url = upload_to_ninjabox(img_bytes, f"{file_id}.jpg")
+            
             append_record(user.id, user.username, file_id, url, hosting)
+            append_csv(user.id, user.username, file_id, url, hosting)
+            
             recent_uploads[file_id] = now
             urls.append(url)
+            
+            await send_admin_notification(context, user.id, user.username, url, hosting)
+            
         except Exception as e:
             urls.append(f"Ошибка: {e}")
+    
     if len(urls) > 1:
         lines = [f"{i+1}: {u}" for i, u in enumerate(urls)]
         text = f"<b>✅ Мультизагрузка на {hosting.capitalize()} завершена:</b>\n" + "\n".join(lines)
     else:
         text = f"✅ <b>Лови адрес на {hosting.capitalize()}:</b>\n{urls[0]}"
+    
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад к выбору", callback_data="upload")]])
     await msg.reply_html(text, disable_web_page_preview=True, reply_markup=reply_markup)
 
@@ -142,12 +224,15 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mgid = msg.media_group_id
     key = (msg.chat.id, mgid) if mgid else (msg.chat.id, file_id)
     last = recent_uploads.get(file_id)
+    
     if last and now - last < DUPLICATE_INTERVAL:
         await msg.reply_html("❗️ Бро, ты грузанул где-то дубль, будь внимателен.")
         return
+    
     img_bytes = await (await context.bot.get_file(file_id)).download_as_bytearray()
     pending_bytes[key].append((file_id, img_bytes))
     hosting = context.user_data.get("selected_hosting")
+    
     if hosting:
         if len(pending_bytes[key]) == 1 and mgid:
             context.application.create_task(process_pending(key, hosting, context, msg, user, now))
@@ -166,6 +251,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
+    
     if data.startswith("host_"):
         parts = data.split("_")
         hosting = "anoimage" if parts[1] == "ano" else "ninjabox"
@@ -173,6 +259,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = choice_keys.get(short_id)
         choice_keys.pop(short_id, None)
         context.user_data["selected_hosting"] = hosting
+        
         if key:
             await on_photo(update, context)
         else:
@@ -227,10 +314,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     ensure_workbook()
+    ensure_csv()
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
@@ -238,8 +327,8 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-
     main()
+
 
 
 
