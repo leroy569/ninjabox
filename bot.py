@@ -15,7 +15,7 @@ from openpyxl import Workbook, load_workbook
 from bs4 import BeautifulSoup
 
 # Токен вашего бота
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TOKEN_BOT_TELEGRAM")
 XLSX_FILE = "uploads.xlsx"
 
 # Буферы и константы
@@ -240,5 +240,6 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
